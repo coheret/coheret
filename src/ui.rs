@@ -48,15 +48,13 @@ pub fn print_status_table(containers: &[InspectedContainer]) {
         .map(|c| c.name().chars().count())
         .max()
         .unwrap_or(MIN_NAME)
-        .max(MIN_NAME)
-        .min(30);
+        .clamp(MIN_NAME, 30);
     let image_width = containers
         .iter()
         .map(|c| c.image().chars().count())
         .max()
         .unwrap_or(MIN_IMAGE)
-        .max(MIN_IMAGE)
-        .min(35);
+        .clamp(MIN_IMAGE, 35);
 
     let header = format!(
         "{name:<name_width$}  {image:<image_width$}  {status:<10}  {health:<11}  {uptime:<9}  {restarts:>8}",
@@ -107,7 +105,10 @@ pub fn print_container_detail(container: &InspectedContainer, log_lines: usize) 
         .as_deref()
         .and_then(health::parse_docker_time)
     {
-        println!("  created:        {}", created.format("%Y-%m-%d %H:%M:%S UTC"));
+        println!(
+            "  created:        {}",
+            created.format("%Y-%m-%d %H:%M:%S UTC")
+        );
     }
     println!(
         "  status:         {}",
@@ -126,7 +127,10 @@ pub fn print_container_detail(container: &InspectedContainer, log_lines: usize) 
     println!("  uptime:         {uptime}");
     if !container.is_running() {
         if let Some(finished) = container.finished_at().and_then(health::parse_docker_time) {
-            println!("  last exit:      {}", finished.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!(
+                "  last exit:      {}",
+                finished.format("%Y-%m-%d %H:%M:%S UTC")
+            );
         }
     }
     println!("  restarts:       {}", container.restart_count());

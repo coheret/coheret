@@ -252,8 +252,7 @@ pub fn inspect(ids_or_names: &[String]) -> Result<Vec<InspectedContainer>> {
 
 /// Inspect a single container, or fail with [`CoheretError::ContainerNotFound`].
 pub fn inspect_one(name_or_id: &str) -> Result<InspectedContainer> {
-    let mut inspected = inspect(&[name_or_id.to_string()])?;
-    inspected
+    inspect(&[name_or_id.to_string()])?
         .into_iter()
         .next()
         .ok_or_else(|| CoheretError::ContainerNotFound(name_or_id.to_string()))

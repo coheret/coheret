@@ -261,10 +261,7 @@ fn cmd_daemon(interval: u64, auto_heal: bool) -> Result<()> {
         match daemon_tick(auto_heal) {
             Ok(actions) => {
                 for action in actions {
-                    println!(
-                        "[{}] {action}",
-                        Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-                    );
+                    println!("[{}] {action}", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
                 }
             }
             Err(err) => eprintln!(
@@ -302,10 +299,9 @@ fn daemon_tick(auto_heal: bool) -> Result<Vec<String>> {
                         "restarted '{}' (schedule: {})",
                         entry.container, entry.cron
                     )),
-                    Err(err) => actions.push(format!(
-                        "failed to restart '{}': {err}",
-                        entry.container
-                    )),
+                    Err(err) => {
+                        actions.push(format!("failed to restart '{}': {err}", entry.container))
+                    }
                 }
                 entry.last_run = Some(now);
                 changed = true;
@@ -322,9 +318,7 @@ fn daemon_tick(auto_heal: bool) -> Result<Vec<String>> {
                 let name = container.name().to_string();
                 match docker::restart(&name, None) {
                     Ok(()) => actions.push(format!("auto-healed unhealthy container '{name}'")),
-                    Err(err) => {
-                        actions.push(format!("failed to auto-heal '{name}': {err}"))
-                    }
+                    Err(err) => actions.push(format!("failed to auto-heal '{name}': {err}")),
                 }
             }
         }
@@ -338,8 +332,9 @@ fn cmd_report(format: ReportFormat, output: Option<PathBuf>) -> Result<()> {
     let containers = docker::list_containers()?;
     let report = report::build(&containers);
     let rendered = match format {
-        ReportFormat::Json => serde_json::to_string_pretty(&report)
-            .map_err(|e| CoheretError::Parse(e.to_string()))?,
+        ReportFormat::Json => {
+            serde_json::to_string_pretty(&report).map_err(|e| CoheretError::Parse(e.to_string()))?
+        }
         ReportFormat::Text => report::render_text(&report),
     };
     match output {
@@ -386,9 +381,7 @@ fn cmd_doctor() -> Result<()> {
     }
 
     if failures > 0 {
-        return Err(CoheretError::Other(format!(
-            "{failures} check(s) failed"
-        )));
+        return Err(CoheretError::Other(format!("{failures} check(s) failed")));
     }
     println!("All checks passed.");
     Ok(())
