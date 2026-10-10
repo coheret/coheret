@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting check: reports violations, never modifies code.
+  fmt:
+    name: rustfmt (report)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Report formatting violations
+        run: cargo fmt --all -- --check
+
+  # Lint check: reports violations, never modifies code.
+  clippy:
+    name: clippy (report)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Report clippy lints
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build:
+    name: build + unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --all-targets
+      - name: Unit tests
+        run: cargo test --all-targets
+
+  # End-to-end: real containers in all health states exercised through the CLI.
+  integration:
+    name: integration (docker containers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Start test containers
+        run: |
+          # running + passing health check
+          docker run -d --name coheret-healthy \
+            --health-cmd "wget -q -O /dev/null http://127.0.0.1/ || exit 1" \
+            --health-interval 2s --health-timeout 2s --health-retries 1 --health-start-period 1s \
+            nginx:alpine
+          # running + failing health check
+          docker run -d --name coheret-unhealthy \
+            --health-cmd "exit 1" \
+            --health-interval 2s --health-timeout 2s --health-retries 1 --health-start-period 1s \
+            alpine sleep 86400
+          # running, no health check
+          docker run -d --name coheret-nocheck alpine sleep 86400
+          # created but never started
+          docker create --name coheret-stopped alpine true
+
+      - name: Wait for health states to settle
+        run: |
+          for i in $(seq 1 30); do
+            h=$(docker inspect --format '{{.State.Health.Status}}' coheret-healthy)
+            u=$(docker inspect --format '{{.State.Health.Status}}' coheret-unhealthy)
+            if [ "$h" = "healthy" ] && [ "$u" = "unhealthy" ]; then
+              break
+            fi
+            sleep 2
+          done
+          echo "healthy=$h unhealthy=$u"
+          docker ps -a
+          if [ "$h" != "healthy" ] || [ "$u" != "unhealthy" ]; then
+            echo "containers did not reach expected health states" >&2
+            exit 1
+          fi
+
+      - name: doctor / status / inspect
+        run: |
+          ./target/release/coheret doctor
+          ./target/release/coheret status
+          ./target/release/coheret inspect coheret-healthy --log-lines 3
+          ./target/release/coheret inspect coheret-unhealthy
+          ./target/release/coheret inspect coheret-stopped
+
+      - name: report (text + JSON validity)
+        run: |
+          ./target/release/coheret report --format text
+          ./target/release/coheret report --format json --output report.json
+          python3 -m json.tool report.json > /dev/null
+          echo "report.json is valid JSON"
+
+      - name: restart (single container + --unhealthy)
+        run: |
+          before=$(docker inspect --format '{{.State.StartedAt}}' coheret-nocheck)
+          ./target/release/coheret restart coheret-nocheck
+          after=$(docker inspect --format '{{.State.StartedAt}}' coheret-nocheck)
+          if [ "$before" = "$after" ]; then
+            echo "restart did not take effect" >&2
+            exit 1
+          fi
+          ./target/release/coheret restart --unhealthy
+
+      - name: schedule + daemon + auto-heal
+        run: |
+          ./target/release/coheret schedule add coheret-nocheck "*/10 * * * * *"
+          ./target/release/coheret schedule list
+          started=$(docker inspect --format '{{.State.StartedAt}}' coheret-nocheck)
+          ./target/release/coheret daemon --interval 5 --auto-heal &
+          daemon_pid=$!
+          fired=0
+          for i in $(seq 1 15); do
+            sleep 5
+            now=$(docker inspect --format '{{.State.StartedAt}}' coheret-nocheck)
+            if [ "$now" != "$started" ]; then
+              fired=1
+              break
+            fi
+          done
+          kill "$daemon_pid" 2>/dev/null || true
+          if [ "$fired" != "1" ]; then
+            echo "daemon never fired the scheduled restart" >&2
+            exit 1
+          fi
+          ./target/release/coheret schedule remove coheret-nocheck
+          ./target/release/coheret schedule clear
+
+      - name: Cleanup containers
+        if: always()
+        run: docker rm -f coheret-healthy coheret-unhealthy coheret-nocheck coheret-stopped || true
