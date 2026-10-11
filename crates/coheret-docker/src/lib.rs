@@ -176,7 +176,11 @@ impl InspectedContainer {
     /// Published ports as (host ip, host port, container port).
     pub fn published_ports(&self) -> Vec<(String, u16, u16)> {
         let mut out = Vec::new();
-        let Some(ports) = self.network_settings.as_ref().and_then(|n| n.ports.as_ref()) else {
+        let Some(ports) = self
+            .network_settings
+            .as_ref()
+            .and_then(|n| n.ports.as_ref())
+        else {
             return out;
         };
         for (key, bindings) in ports {

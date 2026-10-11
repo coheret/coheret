@@ -84,7 +84,11 @@ pub fn health_check(
         let (ty, flags, stream_id, payload) = read_frame(&mut stream, deadline)?;
         if ty == frame_type::SETTINGS {
             if flags & flag::ACK == 0 {
-                write_all(&mut stream, &frame(frame_type::SETTINGS, flag::ACK, 0, &[]), deadline)?;
+                write_all(
+                    &mut stream,
+                    &frame(frame_type::SETTINGS, flag::ACK, 0, &[]),
+                    deadline,
+                )?;
             }
         } else if ty == frame_type::PING {
             if flags & flag::ACK == 0 {
@@ -294,9 +298,14 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
 }
 
 fn read_exact(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<(), String> {
-    stream.set_read_timeout(Some(remaining(deadline)?)).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(remaining(deadline)?))
+        .map_err(|e| e.to_string())?;
     stream.read_exact(buf).map_err(|e| {
-        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
             "timed out".to_string()
         } else {
             format!("read failed: {e}")
@@ -305,9 +314,14 @@ fn read_exact(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Resu
 }
 
 fn write_all(stream: &mut TcpStream, buf: &[u8], deadline: Instant) -> Result<(), String> {
-    stream.set_write_timeout(Some(remaining(deadline)?)).map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(remaining(deadline)?))
+        .map_err(|e| e.to_string())?;
     stream.write_all(buf).map_err(|e| {
-        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
             "timed out".to_string()
         } else {
             format!("write failed: {e}")
@@ -400,7 +414,10 @@ mod tests {
     fn strips_data_frame_padding() {
         assert_eq!(data_payload(0, &[1, 2, 3]), [1u8, 2, 3].as_slice());
         // pad length 1, two payload bytes, one pad byte
-        assert_eq!(data_payload(flag::PADDED, &[1, 9, 9, 0]), [9u8, 9].as_slice());
+        assert_eq!(
+            data_payload(flag::PADDED, &[1, 9, 9, 0]),
+            [9u8, 9].as_slice()
+        );
         assert_eq!(data_payload(flag::PADDED, &[5, 1]), &[] as &[u8]);
     }
 }

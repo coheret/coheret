@@ -498,7 +498,12 @@ fn cmd_endpoints() -> Result<()> {
             .clamp(4, 30);
         println!(
             "{}",
-            format!("{name:<name_width$}  ENDPOINTS", name = "NAME", name_width = name_width).bold()
+            format!(
+                "{name:<name_width$}  ENDPOINTS",
+                name = "NAME",
+                name_width = name_width
+            )
+            .bold()
         );
         for (container, addresses) in &ready_rows {
             let name = ui::truncate(container.name(), name_width);

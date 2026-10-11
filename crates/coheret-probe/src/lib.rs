@@ -716,10 +716,9 @@ fn tcp_probe(host: &str, port: u16, timeout: Duration) -> ProbeOutcome {
     };
     match TcpStream::connect_timeout(&addr, timeout) {
         Ok(_) => ProbeOutcome::Success,
-        Err(err) if err.kind() == ErrorKind::TimedOut => ProbeOutcome::Failure(format!(
-            "connection timed out after {}s",
-            timeout.as_secs()
-        )),
+        Err(err) if err.kind() == ErrorKind::TimedOut => {
+            ProbeOutcome::Failure(format!("connection timed out after {}s", timeout.as_secs()))
+        }
         Err(err) => ProbeOutcome::Failure(format!("connect to {address} failed: {err}")),
     }
 }
@@ -920,7 +919,11 @@ mod tests {
         store.add(entry);
         assert_eq!(store.probes.len(), 1);
         assert!(store.get("web").is_some());
-        assert!(store.get("web").unwrap().probe(ProbeKind::Liveness).is_some());
+        assert!(store
+            .get("web")
+            .unwrap()
+            .probe(ProbeKind::Liveness)
+            .is_some());
         assert!(store.remove("web"));
         assert!(!store.remove("web"));
     }
@@ -939,7 +942,7 @@ mod tests {
         entry.set_probe(ProbeKind::Liveness, tcp_spec(80));
         entry.set_probe(ProbeKind::Startup, tcp_spec(80));
         assert!(entry.has_probes());
-        let kinds: Vec<ProbeKind> = entry.iter_probes().map(|(k, _)| k).collect();
+        let kinds: Vec<ProbeKind> = entry.iter_probes().into_iter().map(|(k, _)| k).collect();
         assert_eq!(kinds, vec![ProbeKind::Startup, ProbeKind::Liveness]);
         assert!(entry.clear_probe(ProbeKind::Liveness));
         assert!(!entry.clear_probe(ProbeKind::Liveness));
@@ -974,7 +977,10 @@ mod tests {
 
     #[test]
     fn describes_methods() {
-        assert_eq!(tcp_spec(5432).method().unwrap().describe(), "tcp-socket :5432");
+        assert_eq!(
+            tcp_spec(5432).method().unwrap().describe(),
+            "tcp-socket :5432"
+        );
         let mut http = ProbeSpec::blank();
         http.http_get = Some(HttpProbe {
             path: "/healthz".to_string(),

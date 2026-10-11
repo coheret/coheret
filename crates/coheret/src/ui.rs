@@ -90,9 +90,7 @@ pub fn print_status_table(
 
     for container in containers {
         let probe_status = probes.get(container.name());
-        let crash_loop = probe_status
-            .map(|p| p.crash_loop_backoff)
-            .unwrap_or(false);
+        let crash_loop = probe_status.map(|p| p.crash_loop_backoff).unwrap_or(false);
         let status = if crash_loop && !container.is_running() {
             "crashloop"
         } else {
@@ -198,10 +196,7 @@ pub fn print_container_detail(
 
 fn print_probe_detail(config: &ContainerProbes, state: Option<&ContainerProbeState>) {
     println!();
-    println!(
-        "Probes (restartPolicy: {}):",
-        config.restart_policy.label()
-    );
+    println!("Probes (restartPolicy: {}):", config.restart_policy.label());
     for (kind, spec) in config.iter_probes() {
         println!("  {:<9} {}", kind.label(), spec.describe());
     }
@@ -211,7 +206,9 @@ fn print_probe_detail(config: &ContainerProbes, state: Option<&ContainerProbeSta
     let ready = if state.ready { "ready" } else { "not ready" };
     println!(
         "  state:    {ready}, probe restarts: {}, failures: startup {}, liveness {}, readiness {}",
-        state.probe_restarts, state.startup_failures, state.liveness_failures,
+        state.probe_restarts,
+        state.startup_failures,
+        state.liveness_failures,
         state.readiness_failures
     );
     if state.in_backoff(Utc::now()) {
