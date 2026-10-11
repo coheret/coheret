@@ -1,0 +1,15 @@
+[package]
+name = "coheret-supervisor"
+description = "Enforces probe semantics on Docker containers: restarts, backoff and readiness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true
+coheret-docker.workspace = true
+coheret-probe.workspace = true

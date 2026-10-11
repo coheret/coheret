@@ -103,6 +103,47 @@ jobs:
           ./target/release/coheret inspect coheret-unhealthy
           ./target/release/coheret inspect coheret-stopped
 
+      - name: probes (add / list / check / endpoints / remove)
+        run: |
+          ./target/release/coheret probe add coheret-healthy --kind liveness \
+            --http-get /:80 --period 2 --timeout 2 --failure-threshold 2
+          ./target/release/coheret probe add coheret-healthy --kind readiness \
+            --tcp 80 --period 2
+          ./target/release/coheret probe add coheret-healthy --kind startup \
+            --http-get /:80 --failure-threshold 5
+          ./target/release/coheret probe add coheret-unhealthy --kind liveness \
+            --exec exit 1 --period 2 --failure-threshold 2
+          ./target/release/coheret probe list
+          ./target/release/coheret probe check coheret-healthy
+          ./target/release/coheret endpoints
+          ./target/release/coheret inspect coheret-healthy
+          ./target/release/coheret report --format json | python3 -m json.tool > /dev/null
+          ./target/release/coheret probe remove coheret-healthy --kind readiness
+          ./target/release/coheret probe remove coheret-healthy
+          ./target/release/coheret probe remove coheret-unhealthy
+
+      - name: probe policies (apply YAML manifest)
+        run: |
+          cat > /tmp/probe-policy.yaml <<'EOF'
+          containers:
+            coheret-healthy:
+              restartPolicy: OnFailure
+              livenessProbe:
+                httpGet:
+                  path: /
+                  port: 80
+                periodSeconds: 2
+                timeoutSeconds: 2
+              readinessProbe:
+                tcpSocket:
+                  port: 80
+                periodSeconds: 2
+          EOF
+          ./target/release/coheret probe apply /tmp/probe-policy.yaml
+          ./target/release/coheret probe list
+          ./target/release/coheret probe check coheret-healthy
+          ./target/release/coheret probe remove coheret-healthy
+
       - name: report (text + JSON validity)
         run: |
           ./target/release/coheret report --format text

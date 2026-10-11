@@ -1,17 +1,39 @@
 //! Thin wrapper around the local `docker` CLI.
 //!
-//! coheret shells out to the `docker` executable instead of talking to the
-//! daemon socket directly. This keeps the tool portable: Windows named pipes,
-//! Unix sockets, and remote contexts configured through `DOCKER_HOST` or
-//! `docker context` all keep working because the CLI handles them.
+//! We shell out to `docker` instead of talking to the daemon socket, so
+//! Windows named pipes, unix sockets and remote contexts all work for free.
 
-use std::process::Command;
+use std::collections::HashMap;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use thiserror::Error;
 
-use crate::error::{CoheretError, Result};
+#[derive(Error, Debug)]
+pub enum DockerError {
+    #[error(
+        "the `docker` CLI was not found in PATH; install Docker and make sure `docker` is available"
+    )]
+    NotInstalled,
 
-/// Result of `docker inspect` for a single container (subset of fields).
+    #[error("docker error: {0}")]
+    Failed(String),
+
+    #[error("failed to parse docker output: {0}")]
+    Parse(String),
+
+    #[error("container not found: {0}")]
+    NotFound(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub type Result<T> = std::result::Result<T, DockerError>;
+
+/// The bits of `docker inspect` output we actually use.
 #[derive(Debug, Deserialize)]
 pub struct InspectedContainer {
     #[serde(rename = "Id")]
@@ -24,6 +46,8 @@ pub struct InspectedContainer {
     pub config: Option<ContainerConfig>,
     #[serde(rename = "HostConfig")]
     pub host_config: Option<HostConfig>,
+    #[serde(rename = "NetworkSettings")]
+    pub network_settings: Option<NetworkSettings>,
     #[serde(rename = "State")]
     pub state: Option<ContainerState>,
     #[serde(rename = "RestartCount")]
@@ -31,17 +55,16 @@ pub struct InspectedContainer {
 }
 
 impl InspectedContainer {
-    /// Container name without the leading slash that `docker inspect` adds.
+    /// Name without the leading slash docker prepends.
     pub fn name(&self) -> &str {
         self.name.trim_start_matches('/')
     }
 
-    /// The familiar 12-character short ID.
+    /// The usual 12-char short id.
     pub fn short_id(&self) -> &str {
         self.id.get(..12).unwrap_or(&self.id)
     }
 
-    /// Image reference the container was created from.
     pub fn image(&self) -> &str {
         self.config
             .as_ref()
@@ -49,7 +72,7 @@ impl InspectedContainer {
             .unwrap_or("<unknown>")
     }
 
-    /// Raw lifecycle status reported by the daemon (running, exited, ...).
+    /// running / exited / paused / ...
     pub fn status(&self) -> &str {
         self.state
             .as_ref()
@@ -57,22 +80,18 @@ impl InspectedContainer {
             .unwrap_or("unknown")
     }
 
-    /// Whether the container is currently running.
     pub fn is_running(&self) -> bool {
         self.state.as_ref().and_then(|s| s.running).unwrap_or(false)
     }
 
-    /// Number of times the daemon has restarted this container.
     pub fn restart_count(&self) -> u64 {
         self.restart_count.unwrap_or(0)
     }
 
-    /// Exit code of the main process, if it has exited at least once.
     pub fn exit_code(&self) -> Option<i64> {
         self.state.as_ref().and_then(|s| s.exit_code)
     }
 
-    /// Whether the container was killed by the OOM killer.
     pub fn oom_killed(&self) -> bool {
         self.state
             .as_ref()
@@ -80,7 +99,6 @@ impl InspectedContainer {
             .unwrap_or(false)
     }
 
-    /// Last error message recorded by the daemon, if any.
     pub fn error(&self) -> Option<&str> {
         self.state
             .as_ref()
@@ -88,18 +106,15 @@ impl InspectedContainer {
             .filter(|e| !e.trim().is_empty())
     }
 
-    /// RFC 3339 timestamp at which the container was (last) started.
     pub fn started_at(&self) -> Option<&str> {
         self.state.as_ref().and_then(|s| s.started_at.as_deref())
     }
 
-    /// RFC 3339 timestamp at which the container last stopped.
     pub fn finished_at(&self) -> Option<&str> {
         self.state.as_ref().and_then(|s| s.finished_at.as_deref())
     }
 
-    /// Raw health status string (`healthy`, `unhealthy`, `starting`), if a
-    /// health check is configured.
+    /// `healthy` / `unhealthy` / `starting`, if a docker health check exists.
     pub fn raw_health(&self) -> Option<&str> {
         self.state
             .as_ref()
@@ -107,7 +122,6 @@ impl InspectedContainer {
             .and_then(|h| h.status.as_deref())
     }
 
-    /// Current consecutive health-check failure count.
     pub fn failing_streak(&self) -> Option<u32> {
         self.state
             .as_ref()
@@ -115,7 +129,6 @@ impl InspectedContainer {
             .and_then(|h| h.failing_streak)
     }
 
-    /// Recent health-check results, oldest first.
     pub fn health_log(&self) -> &[HealthLog] {
         self.state
             .as_ref()
@@ -124,7 +137,6 @@ impl InspectedContainer {
             .unwrap_or(&[])
     }
 
-    /// Configured restart policy as a human-readable string.
     pub fn restart_policy(&self) -> String {
         let policy = self
             .host_config
@@ -140,6 +152,81 @@ impl InspectedContainer {
             }
             None => "no".to_string(),
         }
+    }
+
+    /// Where a probe can reach the container's `port`: the published port on
+    /// 127.0.0.1 if there is one (works on Docker Desktop too), otherwise
+    /// the container's own IP (only reachable from the host on Linux).
+    pub fn probe_endpoint(&self, port: u16) -> Option<(String, u16)> {
+        if let Some(bindings) = self.port_bindings(port) {
+            for binding in bindings {
+                if let Some(host_port) = binding
+                    .host_port
+                    .as_deref()
+                    .and_then(|p| p.parse::<u16>().ok())
+                {
+                    return Some(("127.0.0.1".to_string(), host_port));
+                }
+            }
+        }
+        let ip = self.primary_ip()?;
+        Some((ip.to_string(), port))
+    }
+
+    /// Published ports as (host ip, host port, container port).
+    pub fn published_ports(&self) -> Vec<(String, u16, u16)> {
+        let mut out = Vec::new();
+        let Some(ports) = self.network_settings.as_ref().and_then(|n| n.ports.as_ref()) else {
+            return out;
+        };
+        for (key, bindings) in ports {
+            let Some(container_port) = key.split('/').next().and_then(|p| p.parse::<u16>().ok())
+            else {
+                continue;
+            };
+            let Some(bindings) = bindings else { continue };
+            for binding in bindings {
+                if let Some(host_port) = binding
+                    .host_port
+                    .as_deref()
+                    .and_then(|p| p.parse::<u16>().ok())
+                {
+                    out.push((
+                        binding
+                            .host_ip
+                            .clone()
+                            .unwrap_or_else(|| "0.0.0.0".to_string()),
+                        host_port,
+                        container_port,
+                    ));
+                }
+            }
+        }
+        out.sort_by_key(|(_, host_port, _)| *host_port);
+        out
+    }
+
+    /// The main IP: NetworkSettings.IPAddress, falling back to the first
+    /// attached network that has one.
+    pub fn primary_ip(&self) -> Option<&str> {
+        let settings = self.network_settings.as_ref()?;
+        if let Some(ip) = settings.ip_address.as_deref().filter(|ip| !ip.is_empty()) {
+            return Some(ip);
+        }
+        settings
+            .networks
+            .as_ref()?
+            .values()
+            .find_map(|n| n.ip_address.as_deref().filter(|ip| !ip.is_empty()))
+    }
+
+    fn port_bindings(&self, port: u16) -> Option<&Vec<PortBinding>> {
+        self.network_settings
+            .as_ref()?
+            .ports
+            .as_ref()?
+            .get(&format!("{port}/tcp"))?
+            .as_ref()
     }
 }
 
@@ -161,6 +248,30 @@ pub struct RestartPolicy {
     pub name: Option<String>,
     #[serde(rename = "MaximumRetryCount")]
     pub maximum_retry_count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NetworkSettings {
+    #[serde(rename = "IPAddress")]
+    pub ip_address: Option<String>,
+    #[serde(rename = "Ports")]
+    pub ports: Option<HashMap<String, Option<Vec<PortBinding>>>>,
+    #[serde(rename = "Networks")]
+    pub networks: Option<HashMap<String, NetworkAttachment>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PortBinding {
+    #[serde(rename = "HostIp")]
+    pub host_ip: Option<String>,
+    #[serde(rename = "HostPort")]
+    pub host_port: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NetworkAttachment {
+    #[serde(rename = "IPAddress")]
+    pub ip_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,14 +316,25 @@ pub struct HealthLog {
     pub output: Option<String>,
 }
 
+/// Parse docker's RFC 3339 timestamps; `0001-01-01T00:00:00Z` means "never".
+pub fn parse_docker_time(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with("0001-01-01") {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 /// Run `docker` with the given arguments and return stdout on success.
 fn run(args: &[&str]) -> Result<String> {
     let output = Command::new("docker")
         .args(args)
         .output()
         .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => CoheretError::DockerNotInstalled,
-            _ => CoheretError::Io(e),
+            std::io::ErrorKind::NotFound => DockerError::NotInstalled,
+            _ => DockerError::Io(e),
         })?;
 
     if !output.status.success() {
@@ -222,23 +344,21 @@ fn run(args: &[&str]) -> Result<String> {
         } else {
             stderr
         };
-        return Err(CoheretError::Docker(message));
+        return Err(DockerError::Failed(message));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Version of the docker client binary.
 pub fn client_version() -> Result<String> {
     run(&["version", "--format", "{{.Client.Version}}"]).map(|s| s.trim().to_string())
 }
 
-/// Version of the docker daemon; fails when the daemon is unreachable.
+/// Fails when the daemon is unreachable.
 pub fn server_version() -> Result<String> {
     run(&["version", "--format", "{{.Server.Version}}"]).map(|s| s.trim().to_string())
 }
 
-/// Inspect containers by name or ID.
 pub fn inspect(ids_or_names: &[String]) -> Result<Vec<InspectedContainer>> {
     if ids_or_names.is_empty() {
         return Ok(Vec::new());
@@ -247,15 +367,14 @@ pub fn inspect(ids_or_names: &[String]) -> Result<Vec<InspectedContainer>> {
     args.push("inspect");
     args.extend(ids_or_names.iter().map(String::as_str));
     let raw = run(&args)?;
-    serde_json::from_str(&raw).map_err(|e| CoheretError::Parse(e.to_string()))
+    serde_json::from_str(&raw).map_err(|e| DockerError::Parse(e.to_string()))
 }
 
-/// Inspect a single container, or fail with [`CoheretError::ContainerNotFound`].
 pub fn inspect_one(name_or_id: &str) -> Result<InspectedContainer> {
     inspect(&[name_or_id.to_string()])?
         .into_iter()
         .next()
-        .ok_or_else(|| CoheretError::ContainerNotFound(name_or_id.to_string()))
+        .ok_or_else(|| DockerError::NotFound(name_or_id.to_string()))
 }
 
 /// Inspect every container known to the daemon.
@@ -270,7 +389,7 @@ pub fn list_containers() -> Result<Vec<InspectedContainer>> {
     inspect(&ids)
 }
 
-/// Restart a container, optionally waiting `timeout` seconds before killing it.
+/// Restart a container, waiting `timeout` seconds before killing it.
 pub fn restart(container: &str, timeout: Option<u32>) -> Result<()> {
     let mut args: Vec<String> = vec!["restart".to_string()];
     if let Some(t) = timeout {
@@ -280,6 +399,50 @@ pub fn restart(container: &str, timeout: Option<u32>) -> Result<()> {
     args.push(container.to_string());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run(&args).map(|_| ())
+}
+
+/// Stop a container, waiting `timeout` seconds before killing it.
+pub fn stop(container: &str, timeout: Option<u32>) -> Result<()> {
+    let mut args: Vec<String> = vec!["stop".to_string()];
+    if let Some(t) = timeout {
+        args.push("-t".to_string());
+        args.push(t.to_string());
+    }
+    args.push(container.to_string());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&args).map(|_| ())
+}
+
+/// `docker exec` with a timeout; the process is killed when it expires.
+pub fn exec(container: &str, command: &[String], timeout: Duration) -> Result<i64> {
+    let mut child = Command::new("docker")
+        .arg("exec")
+        .arg(container)
+        .args(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => DockerError::NotInstalled,
+            _ => DockerError::Io(e),
+        })?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(i64::from(status.code().unwrap_or(-1)));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(DockerError::Failed(format!(
+                "`docker exec` in {container} timed out after {}s",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +458,16 @@ mod tests {
             "RestartCount": 3,
             "Config": { "Image": "nginx:latest" },
             "HostConfig": { "RestartPolicy": { "Name": "on-failure", "MaximumRetryCount": 5 } },
+            "NetworkSettings": {
+                "IPAddress": "172.17.0.2",
+                "Ports": {
+                    "80/tcp": [ { "HostIp": "0.0.0.0", "HostPort": "8080" } ],
+                    "443/tcp": null
+                },
+                "Networks": {
+                    "bridge": { "IPAddress": "172.17.0.2" }
+                }
+            },
             "State": {
                 "Status": "running",
                 "Running": true,
@@ -350,5 +523,39 @@ mod tests {
         assert_eq!(c.status(), "unknown");
         assert_eq!(c.restart_policy(), "no");
         assert!(c.health_log().is_empty());
+        assert_eq!(c.primary_ip(), None);
+        assert_eq!(c.probe_endpoint(80), None);
+        assert!(c.published_ports().is_empty());
+    }
+
+    #[test]
+    fn resolves_probe_endpoints() {
+        let parsed: Vec<InspectedContainer> = serde_json::from_str(SAMPLE).unwrap();
+        let c = &parsed[0];
+        // published port wins
+        assert_eq!(c.probe_endpoint(80), Some(("127.0.0.1".to_string(), 8080)));
+        // anything else falls back to the container IP
+        assert_eq!(
+            c.probe_endpoint(9090),
+            Some(("172.17.0.2".to_string(), 9090))
+        );
+    }
+
+    #[test]
+    fn lists_published_ports() {
+        let parsed: Vec<InspectedContainer> = serde_json::from_str(SAMPLE).unwrap();
+        let c = &parsed[0];
+        assert_eq!(
+            c.published_ports(),
+            vec![("0.0.0.0".to_string(), 8080u16, 80u16)]
+        );
+    }
+
+    #[test]
+    fn parses_docker_timestamps() {
+        assert!(parse_docker_time("0001-01-01T00:00:00Z").is_none());
+        assert!(parse_docker_time("").is_none());
+        assert!(parse_docker_time("2026-10-01T08:00:00.123456789Z").is_some());
+        assert!(parse_docker_time("not a date").is_none());
     }
 }

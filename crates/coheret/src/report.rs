@@ -1,11 +1,14 @@
-//! Health report generation.
+//! Point-in-time health reports (text or JSON).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::docker::{self, InspectedContainer};
+use coheret_docker::{self as docker, InspectedContainer};
+use coheret_probe::ProbeStatus;
+
 use crate::health::{self, HealthSummary};
 
 /// Per-container report row.
@@ -22,6 +25,9 @@ pub struct ContainerReport {
     pub exit_code: Option<i64>,
     pub oom_killed: bool,
     pub failing_streak: Option<u32>,
+    /// Present only when the container has probes configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probes: Option<ProbeStatus>,
 }
 
 /// Full report document.
@@ -33,17 +39,23 @@ pub struct Report {
     pub containers: Vec<ContainerReport>,
 }
 
-/// Build a report from inspected containers.
-pub fn build(containers: &[InspectedContainer]) -> Report {
+/// Build a report from the inspected containers and their probe statuses.
+pub fn build(containers: &[InspectedContainer], probes: &HashMap<String, ProbeStatus>) -> Report {
     Report {
         generated_at: Utc::now(),
         docker_server_version: docker::server_version().ok(),
         summary: health::summarize(containers),
-        containers: containers.iter().map(container_report).collect(),
+        containers: containers
+            .iter()
+            .map(|c| container_report(c, probes.get(c.name()).cloned()))
+            .collect(),
     }
 }
 
-fn container_report(container: &InspectedContainer) -> ContainerReport {
+fn container_report(
+    container: &InspectedContainer,
+    probes: Option<ProbeStatus>,
+) -> ContainerReport {
     ContainerReport {
         name: container.name().to_string(),
         id: container.short_id().to_string(),
@@ -56,6 +68,7 @@ fn container_report(container: &InspectedContainer) -> ContainerReport {
         exit_code: container.exit_code(),
         oom_killed: container.oom_killed(),
         failing_streak: container.failing_streak(),
+        probes,
     }
 }
 
@@ -105,6 +118,24 @@ pub fn render_text(report: &Report) -> String {
             if streak > 0 {
                 let _ = writeln!(out, "  failing health checks: {streak}");
             }
+        }
+        if let Some(probes) = &c.probes {
+            let ready = match probes.ready {
+                Some(true) => "ready",
+                Some(false) => "not ready",
+                None => "n/a",
+            };
+            let _ = writeln!(
+                out,
+                "  probes: ready: {ready} | probe restarts: {} | backoff: {}s{}",
+                probes.probe_restarts,
+                probes.backoff_seconds,
+                if probes.crash_loop_backoff {
+                    " (CrashLoopBackOff)"
+                } else {
+                    ""
+                }
+            );
         }
     }
     out

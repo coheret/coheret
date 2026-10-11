@@ -1,4 +1,4 @@
-//! Persistent cron-based restart schedules.
+//! Cron-scheduled restarts, stored as YAML.
 
 use std::fs;
 use std::path::PathBuf;
@@ -12,39 +12,37 @@ use crate::error::{CoheretError, Result};
 
 /// A single scheduled restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScheduleEntry {
     /// Canonical container name.
     pub container: String,
     /// Cron expression as provided by the user (5- or 6-field).
     pub cron: String,
-    /// Last time coheret ran this schedule.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<DateTime<Utc>>,
-    /// When the schedule was created.
     pub created_at: DateTime<Utc>,
 }
 
-/// All configured schedules, persisted as JSON on disk.
+/// All configured schedules (`schedules.yaml`).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ScheduleStore {
     pub entries: Vec<ScheduleEntry>,
 }
 
 impl ScheduleStore {
-    /// Location of the schedule file for the current user.
     pub fn path() -> Result<PathBuf> {
         let base = dirs::config_dir().ok_or(CoheretError::NoConfigDir)?;
-        Ok(base.join("coheret").join("schedules.json"))
+        Ok(base.join("coheret").join("schedules.yaml"))
     }
 
-    /// Load schedules from disk; a missing file yields an empty store.
+    /// A missing file just means no schedules yet.
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
             return Ok(Self::default());
         }
         let raw = fs::read_to_string(&path)?;
-        serde_json::from_str(&raw)
+        serde_yaml::from_str(&raw)
             .map_err(|e| CoheretError::Parse(format!("{}: {e}", path.display())))
     }
 
@@ -54,8 +52,7 @@ impl ScheduleStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let raw =
-            serde_json::to_string_pretty(self).map_err(|e| CoheretError::Parse(e.to_string()))?;
+        let raw = serde_yaml::to_string(self).map_err(|e| CoheretError::Parse(e.to_string()))?;
         fs::write(&path, raw)?;
         Ok(())
     }
@@ -66,7 +63,6 @@ impl ScheduleStore {
         self.entries.push(entry);
     }
 
-    /// Remove the schedule for a container; returns whether one existed.
     pub fn remove(&mut self, container: &str) -> bool {
         let before = self.entries.len();
         self.entries.retain(|e| e.container != container);

@@ -1,8 +1,13 @@
-//! Terminal rendering helpers.
+//! Terminal output helpers.
 
+use std::collections::HashMap;
+
+use chrono::Utc;
 use colored::{ColoredString, Colorize};
 
-use crate::docker::{HealthLog, InspectedContainer};
+use coheret_docker::{HealthLog, InspectedContainer};
+use coheret_probe::{ContainerProbeState, ContainerProbes, ProbeStatus};
+
 use crate::health::{self, HealthStatus};
 
 /// Truncate a string to at most `max` characters, appending `...` when cut.
@@ -32,14 +37,27 @@ fn color_health(status: HealthStatus, padded: String) -> ColoredString {
 fn color_status(status: &str, padded: String) -> ColoredString {
     match status {
         "running" => padded.green(),
-        "restarting" | "paused" => padded.yellow(),
+        "restarting" | "paused" | "crashloop" => padded.yellow(),
         "dead" => padded.red(),
         _ => padded.dimmed(),
     }
 }
 
-/// Print the aggregated status table used by `status` and `watch`.
-pub fn print_status_table(containers: &[InspectedContainer]) {
+fn color_ready(ready: Option<bool>) -> ColoredString {
+    match ready {
+        Some(true) => format!("{:<7}", "ready").green(),
+        Some(false) => format!("{:<7}", "unready").red().bold(),
+        None => format!("{:<7}", "-").dimmed(),
+    }
+}
+
+/// The status table used by `status` and `watch`. Containers with probes get
+/// a READY column; a container waiting out its restart backoff shows as
+/// `crashloop`.
+pub fn print_status_table(
+    containers: &[InspectedContainer],
+    probes: &HashMap<String, ProbeStatus>,
+) {
     const MIN_NAME: usize = 4; // fits "NAME"
     const MIN_IMAGE: usize = 5; // fits "IMAGE"
 
@@ -57,11 +75,12 @@ pub fn print_status_table(containers: &[InspectedContainer]) {
         .clamp(MIN_IMAGE, 35);
 
     let header = format!(
-        "{name:<name_width$}  {image:<image_width$}  {status:<10}  {health:<11}  {uptime:<9}  {restarts:>8}",
+        "{name:<name_width$}  {image:<image_width$}  {status:<10}  {health:<11}  {ready:<7}  {uptime:<9}  {restarts:>8}",
         name = "NAME",
         image = "IMAGE",
         status = "STATUS",
         health = "HEALTH",
+        ready = "READY",
         uptime = "UPTIME",
         restarts = "RESTARTS",
         name_width = name_width,
@@ -70,7 +89,16 @@ pub fn print_status_table(containers: &[InspectedContainer]) {
     println!("{}", header.bold());
 
     for container in containers {
-        let status = container.status();
+        let probe_status = probes.get(container.name());
+        let crash_loop = probe_status
+            .map(|p| p.crash_loop_backoff)
+            .unwrap_or(false);
+        let status = if crash_loop && !container.is_running() {
+            "crashloop"
+        } else {
+            container.status()
+        };
+        let ready = probe_status.and_then(|p| p.ready);
         let health_status = health::classify(container);
         let uptime = health::uptime(container)
             .map(health::humanize_duration)
@@ -80,11 +108,12 @@ pub fn print_status_table(containers: &[InspectedContainer]) {
         let image = truncate(container.image(), image_width);
 
         println!(
-            "{name:<name_width$}  {image:<image_width$}  {status}  {health}  {uptime:<9}  {restarts:>8}",
+            "{name:<name_width$}  {image:<image_width$}  {status}  {health}  {ready}  {uptime:<9}  {restarts:>8}",
             name = name,
             image = image,
             status = color_status(status, format!("{status:<10}")),
             health = color_health(health_status, format!("{:<11}", health_status.label())),
+            ready = color_ready(ready),
             uptime = uptime,
             restarts = container.restart_count(),
             name_width = name_width,
@@ -94,7 +123,12 @@ pub fn print_status_table(containers: &[InspectedContainer]) {
 }
 
 /// Print the detailed view used by `inspect`.
-pub fn print_container_detail(container: &InspectedContainer, log_lines: usize) {
+pub fn print_container_detail(
+    container: &InspectedContainer,
+    log_lines: usize,
+    probes: Option<&ContainerProbes>,
+    probe_state: Option<&ContainerProbeState>,
+) {
     let health_status = health::classify(container);
 
     println!("{}", container.name().bold());
@@ -145,6 +179,10 @@ pub fn print_container_detail(container: &InspectedContainer, log_lines: usize) 
         println!("  error:          {}", error.red());
     }
 
+    if let Some(config) = probes {
+        print_probe_detail(config, probe_state);
+    }
+
     println!();
     let logs = container.health_log();
     if logs.is_empty() {
@@ -155,6 +193,37 @@ pub fn print_container_detail(container: &InspectedContainer, log_lines: usize) 
     let start = logs.len().saturating_sub(log_lines.max(1));
     for log in &logs[start..] {
         print_health_log(log);
+    }
+}
+
+fn print_probe_detail(config: &ContainerProbes, state: Option<&ContainerProbeState>) {
+    println!();
+    println!(
+        "Probes (restartPolicy: {}):",
+        config.restart_policy.label()
+    );
+    for (kind, spec) in config.iter_probes() {
+        println!("  {:<9} {}", kind.label(), spec.describe());
+    }
+    let Some(state) = state else {
+        return;
+    };
+    let ready = if state.ready { "ready" } else { "not ready" };
+    println!(
+        "  state:    {ready}, probe restarts: {}, failures: startup {}, liveness {}, readiness {}",
+        state.probe_restarts, state.startup_failures, state.liveness_failures,
+        state.readiness_failures
+    );
+    if state.in_backoff(Utc::now()) {
+        let next = state
+            .next_restart_at
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "  backoff:  {} ({}s, next restart attempt at {next})",
+            "CrashLoopBackOff".yellow(),
+            state.backoff_seconds
+        );
     }
 }
 
